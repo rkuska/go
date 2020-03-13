@@ -2577,8 +2577,9 @@ type Server struct {
 	// value.
 	ConnContext func(ctx context.Context, c net.Conn) context.Context
 
+	inShutdown atomicBool // true when when server is in shutdown
+
 	disableKeepAlives int32     // accessed atomically.
-	inShutdown        int32     // accessed atomically (non-zero means we're in Shutdown)
 	nextProtoOnce     sync.Once // guards setupHTTP2_* init
 	nextProtoErr      error     // result of http2.ConfigureServer if used
 
@@ -2624,7 +2625,7 @@ func (s *Server) closeDoneChanLocked() {
 // Close returns any error returned from closing the Server's
 // underlying Listener(s).
 func (srv *Server) Close() error {
-	atomic.StoreInt32(&srv.inShutdown, 1)
+	srv.inShutdown.setTrue()
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
 	srv.closeDoneChanLocked()
@@ -2666,7 +2667,7 @@ var shutdownPollInterval = 500 * time.Millisecond
 // Once Shutdown has been called on a server, it may not be reused;
 // future calls to methods such as Serve will return ErrServerClosed.
 func (srv *Server) Shutdown(ctx context.Context) error {
-	atomic.StoreInt32(&srv.inShutdown, 1)
+	srv.inShutdown.setTrue()
 
 	srv.mu.Lock()
 	lnerr := srv.closeListenersLocked()
@@ -2816,7 +2817,7 @@ func (sh serverHandler) ServeHTTP(rw ResponseWriter, req *Request) {
 // ListenAndServe always returns a non-nil error. After Shutdown or Close,
 // the returned error is ErrServerClosed.
 func (srv *Server) ListenAndServe() error {
-	if srv.shuttingDown() {
+	if srv.inShutdown.isSet() {
 		return ErrServerClosed
 	}
 	addr := srv.Addr
@@ -2990,7 +2991,7 @@ func (s *Server) trackListener(ln *net.Listener, add bool) bool {
 		s.listeners = make(map[*net.Listener]struct{})
 	}
 	if add {
-		if s.shuttingDown() {
+		if s.inShutdown.isSet() {
 			return false
 		}
 		s.listeners[ln] = struct{}{}
@@ -3028,13 +3029,7 @@ func (s *Server) readHeaderTimeout() time.Duration {
 }
 
 func (s *Server) doKeepAlives() bool {
-	return atomic.LoadInt32(&s.disableKeepAlives) == 0 && !s.shuttingDown()
-}
-
-func (s *Server) shuttingDown() bool {
-	// TODO: replace inShutdown with the existing atomicBool type;
-	// see https://github.com/golang/go/issues/20239#issuecomment-381434582
-	return atomic.LoadInt32(&s.inShutdown) != 0
+	return atomic.LoadInt32(&s.disableKeepAlives) == 0 && !s.inShutdown.isSet()
 }
 
 // SetKeepAlivesEnabled controls whether HTTP keep-alives are enabled.
@@ -3112,7 +3107,7 @@ func ListenAndServeTLS(addr, certFile, keyFile string, handler Handler) error {
 // ListenAndServeTLS always returns a non-nil error. After Shutdown or
 // Close, the returned error is ErrServerClosed.
 func (srv *Server) ListenAndServeTLS(certFile, keyFile string) error {
-	if srv.shuttingDown() {
+	if srv.inShutdown.isSet() {
 		return ErrServerClosed
 	}
 	addr := srv.Addr
